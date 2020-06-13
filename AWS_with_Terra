@@ -1,0 +1,309 @@
+provider "aws" {
+  region = "us-east-2"
+}
+
+
+### creating the security group fop allowing 443,80,22 inbound rules
+
+resource "aws_security_group" "Test-TF" {
+  name        = "Test-TF"
+  description = "Allow Web & ssh inbound traffic"
+
+  ingress {
+    description = "TLS from VPC"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks =  ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "TLS from VPC"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks =  ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "TLS from VPC"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks =  ["0.0.0.0/0"]
+  }
+
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "allow_tls"
+  }
+}
+
+
+
+### attaching the locally created key pair with the name "Test-key's" public key to instances
+
+
+variable "key_name" {
+  type = "string"
+  default = "Test-key"
+}
+
+variable "ami_name" {
+  type = "string"
+  default = "ami-026dea5602e368e96"
+}
+
+/*
+resource "aws_key_pair" "generated_key" {
+  key_name   = var.key_name
+  public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC2Y7YzSN5eA3hO4/iJYZDqkeex0nV0z1EXpjKvnJpicWhLOFhj5XVLIjR5bB9+df0yq7WvFr+Q9DBqTDAaBTyumGLSxijqjMGHsMqrQ6LTXZV/7XFuNyHGtTD4NsLijdv9YKHlfO7yeG4CUFUYY4AZkyKgYMNDx7amc8qI/m/xXZVVQmfOW+sHv4K7oklxZBlw280CabQew8Yeli8iiyrj7/yg8RH75G5Kh7w6zCNjq3WBhzXv6elhRPKXlydnc6ZTn7BI3iVIwwTmv6lEUpj7Y/AVOMCyBGkQsRhVWrHvRgFOhMlBjs3mW8o1wup1hoYZ6yFzhF2cWSQFVcUABtr3 root@localhost.localdomain"
+}
+
+*/
+
+
+
+## creating the instance and installing the packages
+
+resource "aws_instance" "web" {
+    ami           = var.ami_name
+    instance_type = "t2.micro"
+    security_groups = [ "Test-TF" ]
+    availability_zone = "us-east-2b"
+    key_name      = "ohio_sifan"
+
+    tags = {
+      Name = "RHEL7_OS_from_TF"
+    }
+
+    connection {
+      type = "ssh"
+      user = "ec2-user"
+      private_key =  file("/root/.ssh/ohio_sifan")
+      host = aws_instance.web.public_ip
+    }
+
+    provisioner "remote-exec" {
+      inline = [
+        "sudo yum install httpd git php -y",
+        "sudo systemctl start httpd",
+        "sudo systemctl enable httpd",
+
+      ]
+    }
+}
+
+
+
+### creating and attaching the EBS volume to created insatances
+
+resource "aws_ebs_volume" "Test-EBS" {
+    availability_zone = aws_instance.web.availability_zone
+    size              = 1
+    tags = {
+      Name = "web_ebs"
+    }
+}
+
+
+resource "aws_volume_attachment" "ebs_att" {
+    device_name = "/dev/sdh"
+    volume_id   = "${aws_ebs_volume.Test-EBS.id}"
+    instance_id = "${aws_instance.web.id}"
+    force_detach = true
+}
+
+
+
+
+
+output "EBS_values" {
+    value = aws_ebs_volume.Test-EBS
+}
+
+output "Instance" {
+    value = aws_instance.web.public_ip
+}
+
+
+
+### mounting the created EBS volume to created instance
+
+resource "null_resource" "null_resource_for_mount" {
+
+    depends_on = [
+      aws_volume_attachment.ebs_att,
+    ]
+
+    connection {
+      type = "ssh"
+      user = "ec2-user"
+      private_key =  file("/root/.ssh/ohio_sifan")
+      host = aws_instance.web.public_ip
+    }    
+    
+    provisioner "remote-exec" {
+      inline = [
+        "sudo mkfs.ext4 /dev/xvdh",
+        "sudo mount /dev/xvdh /var/www/html",
+        "sudo rm -rf /var/www/html/*",
+        "sudo git clone https://github.com/mohamedafrid-lab/Terraform-test.git /var/www/html",
+      ]
+    }
+}
+
+
+
+
+### creating the bucket for image storage
+
+
+resource "aws_s3_bucket" "bucket_for_web" {
+    bucket = "bucketforwebapp11112222"
+    acl = "public-read"
+    versioning {
+      enabled = true
+    }
+    tags = {
+      Name = "bucket_for_web"
+    }
+}
+
+
+
+## uploading the image to the bucket
+
+
+resource "aws_s3_bucket_object" "image_object" {
+  bucket = aws_s3_bucket.bucket_for_web.bucket
+  key    = "WEB_IMAGE"
+  acl = "public-read"
+  source = "/root/Barca.jpg"
+  etag = filemd5("/root/Barca.jpg")
+}
+
+
+
+
+### creating the cloudFront for  faster image access
+
+resource "aws_cloudfront_origin_access_identity" "origin_access_identity" {
+  comment = "creating OAI"
+}
+
+
+locals {
+  s3_origin_id = "myS3Origin11112222"
+}
+
+
+resource "aws_cloudfront_distribution" "s3_distribution" {
+
+    depends_on = [
+      null_resource.null_resource_for_mount,
+    ]
+
+  origin {
+    domain_name = "${aws_s3_bucket.bucket_for_web.bucket_regional_domain_name}"
+    origin_id   = "${local.s3_origin_id}"
+
+    s3_origin_config {
+      origin_access_identity = "${aws_cloudfront_origin_access_identity.origin_access_identity.cloudfront_access_identity_path}"
+    }
+  }
+
+
+  enabled             = true
+  is_ipv6_enabled     = true
+
+
+  default_cache_behavior {
+    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "${local.s3_origin_id}"
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  tags = {
+    Environment = "production"
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  connection {
+    type = "ssh"
+    user = "ec2-user"
+    private_key =  file("/root/.ssh/ohio_sifan")
+    host = aws_instance.web.public_ip
+  }   
+
+  provisioner "remote-exec" {
+          inline  = [
+              # "sudo su << \"EOF\" \n echo \"<img src='${self.domain_name}'>\" >> /var/www/html/index.html \n \"EOF\""
+              "sudo su << EOF",
+              "echo \"<center><img src='http://${self.domain_name}/${aws_s3_bucket_object.image_object.key}' height='200px' width='200px'></center>\" >> /var/www/html/index.php",
+              "EOF"
+          ]
+      }
+  }
+
+
+## creating the policy for bucket to allow OAI created by cloudFront for access the S3 images
+
+
+data "aws_iam_policy_document" "s3_policy" {
+
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.bucket_for_web.arn}/*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["${aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn}"]
+    }
+  }
+
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = ["${aws_s3_bucket.bucket_for_web.arn}"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["${aws_cloudfront_origin_access_identity.origin_access_identity.iam_arn}"]
+    }
+  }
+}
+
+
+resource "aws_s3_bucket_policy" "bucket_for_web_policy" {
+  bucket = "${aws_s3_bucket.bucket_for_web.id}"
+  policy = "${data.aws_iam_policy_document.s3_policy.json}"
+}
